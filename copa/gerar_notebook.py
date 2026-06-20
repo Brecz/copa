@@ -203,7 +203,7 @@ if 'df' in locals() and not df.empty:
         return 1.0
 
     # Log-Likelihood Function Customizada (Campo Neutro)
-    def dixon_coles_loglik(params, df_matches, xi=0.002):
+    def dixon_coles_loglik(params, df_matches, xi=0.002, lambda_reg=0.05):
         # params[:n] = Forças de Ataque (alpha)
         # params[n:2n] = Forças de Defesa (beta)
         # params[2n] = Fator Rho (Tau)
@@ -218,13 +218,14 @@ if 'df' in locals() and not df.empty:
         gols_home = df_matches['home_score'].values
         gols_away = df_matches['away_score'].values
         dias = df_matches['dias_atras'].values
+        peso_camp = df_matches.get('peso_camp', pd.Series(np.ones(len(gols_home)))).values
         
         # Lambdas (Sem fator casa para campo neutro)
         lambda_home = np.exp(alpha[idx_home] + beta[idx_away])
         lambda_away = np.exp(alpha[idx_away] + beta[idx_home])
         
-        # Peso Temporal
-        pesos = np.exp(-xi * dias)
+        # Peso Temporal combinado com peso de torneio
+        pesos = np.exp(-xi * dias) * peso_camp
         
         # Log-Verossimilhança
         log_probs = []
@@ -237,13 +238,25 @@ if 'df' in locals() and not df.empty:
             else:
                 log_probs.append(np.log(prob_corrigida) * p)
                 
-        return -np.sum(log_probs)
+        penalty = lambda_reg * (np.sum(alpha**2) + np.sum(beta**2))
+        return -np.sum(log_probs) + penalty
 
     # Preparando dados
     df_opt = df_elite.copy()
     df_opt['home_idx'] = df_opt['home_team'].map(sel_idx)
     df_opt['away_idx'] = df_opt['away_team'].map(sel_idx)
     df_opt['dias_atras'] = (hoje - df_opt['date']).dt.days
+
+    def get_peso_campeonato(tourney):
+        if 'World Cup' in tourney or 'Copa America' in tourney or 'Euro' in tourney:
+            return 1.0
+        elif 'Friendly' in tourney:
+            return 0.5
+        return 0.8
+    if 'tournament' in df_opt.columns:
+        df_opt['peso_camp'] = df_opt['tournament'].apply(get_peso_campeonato)
+    else:
+        df_opt['peso_camp'] = 1.0
 
     # Restrição: A soma das forças de ataque é 0 (média de exp(alpha) próxima de 1)
     # Isso ancora o modelo para evitar que divirja para o infinito
@@ -252,8 +265,24 @@ if 'df' in locals() and not df.empty:
         
     cons = [{'type': 'eq', 'fun': constraint_func}]
     
-    # Chute inicial (Forças = 0 -> exp(0)=1, Rho = 0)
-    init_params = np.zeros(2 * n_selecoes + 1)
+    # Smart Start: Chute inicial com Poisson Ingênuo
+    media_gols_geral = (df_elite['home_score'].mean() + df_elite['away_score'].mean()) / 2
+    init_alpha = np.zeros(n_selecoes)
+    init_beta = np.zeros(n_selecoes)
+    for sel, idx in sel_idx.items():
+        jogos_casa = df_elite[df_elite['home_team'] == sel]
+        jogos_fora = df_elite[df_elite['away_team'] == sel]
+        total_jogos = len(jogos_casa) + len(jogos_fora)
+        if total_jogos > 0:
+            gf = jogos_casa['home_score'].sum() + jogos_fora['away_score'].sum()
+            gs = jogos_casa['away_score'].sum() + jogos_fora['home_score'].sum()
+            ataq_ing = (gf / total_jogos) / media_gols_geral
+            def_ing = (gs / total_jogos) / media_gols_geral
+            init_alpha[idx] = np.log(max(ataq_ing, 0.01))
+            init_beta[idx] = np.log(max(def_ing, 0.01))
+            
+    init_alpha = init_alpha - np.mean(init_alpha)
+    init_params = np.concatenate([init_alpha, init_beta, [0.0]])
     
     print("Iniciando Otimização Dixon-Coles... Isso pode levar de 10 a 60 segundos.")
     
@@ -340,7 +369,7 @@ else:
     print("Execute as células anteriores para gerar a matriz final.")
 """)
 
-with open('C:\\\\Users\\\\caubo\\\\Desktop\\\\copa\\\\seminario_copa_2026.ipynb', 'w', encoding='utf-8') as f:
+with open('seminario_copa_2026.ipynb', 'w', encoding='utf-8') as f:
     json.dump(notebook, f, indent=2, ensure_ascii=False)
 
 print("Notebook gerado com sucesso!")
