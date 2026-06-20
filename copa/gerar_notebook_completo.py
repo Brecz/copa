@@ -182,8 +182,8 @@ if 'df' in locals() and not df.empty:
         elif x == 1 and y == 1: return 1 - rho
         return 1.0
 
-    # Log-Likelihood VETORIZADA (Elimina Laços FOR, aumento de 50x na velocidade)
-    def dixon_coles_loglik_vectorized(params, df_matches, xi=0.002):
+    # Log-Likelihood VETORIZADA com Regularização L2 e Pesos de Torneio
+    def dixon_coles_loglik_vectorized(params, df_matches, xi=0.002, lambda_reg=0.05):
         alpha = params[:n_selecoes]
         beta = params[n_selecoes:2*n_selecoes]
         rho = params[2*n_selecoes]
@@ -193,10 +193,11 @@ if 'df' in locals() and not df.empty:
         x = df_matches['home_score'].values
         y = df_matches['away_score'].values
         dias = df_matches['dias_atras'].values
+        peso_camp = df_matches.get('peso_camp', pd.Series(np.ones(len(x)))).values
         
         lam = np.exp(alpha[idx_home] + beta[idx_away])
         mu = np.exp(alpha[idx_away] + beta[idx_home])
-        pesos = np.exp(-xi * dias)
+        pesos = np.exp(-xi * dias) * peso_camp
         
         prob_poisson_x = poisson.pmf(x, lam)
         prob_poisson_y = poisson.pmf(y, mu)
@@ -210,19 +211,49 @@ if 'df' in locals() and not df.empty:
         prob_final = prob_poisson_x * prob_poisson_y * corr
         log_p = np.where(prob_final <= 0, -10000, np.log(prob_final))
         
-        return -np.sum(log_p * pesos)
+        penalty = lambda_reg * (np.sum(alpha**2) + np.sum(beta**2))
+        return -np.sum(log_p * pesos) + penalty
 
     df_opt = df_geral.copy()
     df_opt['home_idx'] = df_opt['home_team'].map(sel_idx)
     df_opt['away_idx'] = df_opt['away_team'].map(sel_idx)
     df_opt['dias_atras'] = (hoje - df_opt['date']).dt.days
 
+    def get_peso_campeonato(tourney):
+        if 'World Cup' in tourney or 'Copa America' in tourney or 'Euro' in tourney:
+            return 1.0
+        elif 'Friendly' in tourney:
+            return 0.5
+        return 0.8
+    if 'tournament' in df_opt.columns:
+        df_opt['peso_camp'] = df_opt['tournament'].apply(get_peso_campeonato)
+    else:
+        df_opt['peso_camp'] = 1.0
+
     # Restrição de Ancoragem para estabilidade matemática
     def constraint_func(x):
         return sum(x[:n_selecoes])
         
     cons = [{'type': 'eq', 'fun': constraint_func}]
-    init_params = np.zeros(2 * n_selecoes + 1)
+    
+    # Smart Start: Chute inicial com médias ingênuas para acelerar convergência e fugir de mínimos locais
+    media_gols_geral = (df_geral['home_score'].mean() + df_geral['away_score'].mean()) / 2
+    init_alpha = np.zeros(n_selecoes)
+    init_beta = np.zeros(n_selecoes)
+    for sel, idx in sel_idx.items():
+        jogos_casa = df_geral[df_geral['home_team'] == sel]
+        jogos_fora = df_geral[df_geral['away_team'] == sel]
+        total_jogos = len(jogos_casa) + len(jogos_fora)
+        if total_jogos > 0:
+            gf = jogos_casa['home_score'].sum() + jogos_fora['away_score'].sum()
+            gs = jogos_casa['away_score'].sum() + jogos_fora['home_score'].sum()
+            ataq_ing = (gf / total_jogos) / media_gols_geral
+            def_ing = (gs / total_jogos) / media_gols_geral
+            init_alpha[idx] = np.log(max(ataq_ing, 0.01))
+            init_beta[idx] = np.log(max(def_ing, 0.01))
+    
+    init_alpha = init_alpha - np.mean(init_alpha) # Aplicar a constraint sum(alpha)=0 no chute inicial
+    init_params = np.concatenate([init_alpha, init_beta, [0.0]])
     
     print(f"Otimizando globalmente {n_selecoes} seleções simultaneamente...")
     print("Iniciando SLSQP Vetorizado... Deve demorar apenas entre 5 a 20 segundos!")
@@ -293,5 +324,5 @@ add_code("""if 'matriz_dc' in locals():
     print("Se a Odd da casa for MAIOR que a sua Odd Justa, ali existe Valor Esperado Positivo (EV+).")
 """)
 
-with open('C:\\\\Users\\\\caubo\\\\Desktop\\\\copa\\\\seminario_copa_2026_completo.ipynb', 'w', encoding='utf-8') as f:
+with open('seminario_copa_2026_completo.ipynb', 'w', encoding='utf-8') as f:
     json.dump(notebook, f, indent=2, ensure_ascii=False)
